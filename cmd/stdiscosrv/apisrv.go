@@ -264,7 +264,7 @@ func (s *apiSrv) handlePOST(remoteAddr *net.TCPAddr, w http.ResponseWriter, req 
 	}
 
 	var ann announcement
-	if err := json.NewDecoder(req.Body).Decode(&ann); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, req.Body, maxAnnouncementSize)).Decode(&ann); err != nil {
 		slog.Debug("Failed to decode request", "id", reqID, "error", err)
 		announceRequestsTotal.WithLabelValues("bad_request").Inc()
 		w.Header().Set("Retry-After", errorRetryAfterString())

@@ -47,9 +47,10 @@ const (
 	notFoundRetryUnknownMinSeconds = 60
 	notFoundRetryUnknownMaxSeconds = 3600
 
-	httpReadTimeout    = 5 * time.Second
-	httpWriteTimeout   = 5 * time.Second
-	httpMaxHeaderBytes = 1 << 10
+	httpReadTimeout     = 5 * time.Second
+	httpWriteTimeout    = 5 * time.Second
+	httpMaxHeaderBytes  = 1 << 10
+	maxAnnouncementSize = 1 << 20
 
 	// Size of the replication outbox channel
 	replicationOutboxSize = 10000
