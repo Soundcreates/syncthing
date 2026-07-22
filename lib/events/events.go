@@ -484,6 +484,7 @@ type bufferedSubscription struct {
 type BufferedSubscription interface {
 	Since(id int, into []Event, timeout time.Duration) []Event
 	Mask() EventType
+	Unsubscribe()
 }
 
 func NewBufferedSubscription(s Subscription, size int) BufferedSubscription {
@@ -540,6 +541,10 @@ func (s *bufferedSubscription) Since(id int, into []Event, timeout time.Duration
 
 func (s *bufferedSubscription) Mask() EventType {
 	return s.sub.Mask()
+}
+
+func (s *bufferedSubscription) Unsubscribe() {
+	s.sub.Unsubscribe()
 }
 
 // Error returns a string pointer suitable for JSON marshalling errors. It

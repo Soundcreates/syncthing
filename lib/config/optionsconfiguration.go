@@ -57,6 +57,7 @@ type OptionsConfiguration struct {
 	DeprecatedDefaultFolderPath string   `json:"-" xml:"defaultFolderPath,omitempty"` // Deprecated: Do not use.
 	SetLowPriority              bool     `json:"setLowPriority" xml:"setLowPriority" default:"true"`
 	RawMaxFolderConcurrency     int      `json:"maxFolderConcurrency" xml:"maxFolderConcurrency"`
+	RawMaxEventSubs             int      `json:"maxEventSubscriptions" xml:"maxEventSubscriptions"`
 	CRURL                       string   `json:"crURL" xml:"crashReportingURL" default:"https://crash.syncthing.net/newcrash"`
 	CREnabled                   bool     `json:"crashReportingEnabled" xml:"crashReportingEnabled" default:"true"`
 	StunKeepaliveStartS         int      `json:"stunKeepaliveStartS" xml:"stunKeepaliveStartS" default:"180"`
@@ -243,6 +244,17 @@ func (opts OptionsConfiguration) MaxFolderConcurrency() int {
 	// getting nothing done... (Median number of folders out there at time
 	// of writing is two, 95-percentile at 12 folders.)
 	return 4 // https://xkcd.com/221/
+}
+
+// DefaultMaxEventSubs is the cap on cached /rest/events subscriptions used
+// when maxEventSubscriptions is unset or non-positive.
+const DefaultMaxEventSubs = 32
+
+func (opts OptionsConfiguration) MaxEventSubs() int {
+	if opts.RawMaxEventSubs > 0 {
+		return opts.RawMaxEventSubs
+	}
+	return DefaultMaxEventSubs
 }
 
 func (opts OptionsConfiguration) MaxConcurrentIncomingRequestKiB() int {

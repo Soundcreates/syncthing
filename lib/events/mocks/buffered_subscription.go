@@ -19,6 +19,10 @@ type BufferedSubscription struct {
 	maskReturnsOnCall map[int]struct {
 		result1 events.EventType
 	}
+	UnsubscribeStub        func()
+	unsubscribeMutex       sync.RWMutex
+	unsubscribeArgsForCall []struct {
+	}
 	SinceStub        func(int, []events.Event, time.Duration) []events.Event
 	sinceMutex       sync.RWMutex
 	sinceArgsForCall []struct {
@@ -87,6 +91,30 @@ func (fake *BufferedSubscription) MaskReturnsOnCall(i int, result1 events.EventT
 	fake.maskReturnsOnCall[i] = struct {
 		result1 events.EventType
 	}{result1}
+}
+
+func (fake *BufferedSubscription) Unsubscribe() {
+	fake.unsubscribeMutex.Lock()
+	fake.unsubscribeArgsForCall = append(fake.unsubscribeArgsForCall, struct {
+	}{})
+	stub := fake.UnsubscribeStub
+	fake.recordInvocation("Unsubscribe", []interface{}{})
+	fake.unsubscribeMutex.Unlock()
+	if stub != nil {
+		stub()
+	}
+}
+
+func (fake *BufferedSubscription) UnsubscribeCallCount() int {
+	fake.unsubscribeMutex.RLock()
+	defer fake.unsubscribeMutex.RUnlock()
+	return len(fake.unsubscribeArgsForCall)
+}
+
+func (fake *BufferedSubscription) UnsubscribeCalls(stub func()) {
+	fake.unsubscribeMutex.Lock()
+	defer fake.unsubscribeMutex.Unlock()
+	fake.UnsubscribeStub = stub
 }
 
 func (fake *BufferedSubscription) Since(arg1 int, arg2 []events.Event, arg3 time.Duration) []events.Event {

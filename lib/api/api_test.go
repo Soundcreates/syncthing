@@ -21,6 +21,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1582,6 +1583,240 @@ func TestEventMasks(t *testing.T) {
 	}
 	if res := svc.getEventSub(events.LocalIndexUpdated); res == nil || res == defSub || res == diskSub {
 		t.Errorf("should have returned a valid, non-default event sub")
+	}
+}
+
+func TestEventSubEvictionUnsubscribesOldest(t *testing.T) {
+	t.Parallel()
+
+	cfg := newMockedConfig()
+	defSub := new(eventmocks.BufferedSubscription)
+	diskSub := new(eventmocks.BufferedSubscription)
+	oldestSub := new(eventmocks.BufferedSubscription)
+	newerSub := new(eventmocks.BufferedSubscription)
+	mdb, err := sqlite.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		mdb.Close()
+	})
+	kdb := db.NewMiscDB(mdb)
+	svc := New(protocol.LocalDeviceID, cfg, "", "syncthing", nil, defSub, diskSub, events.NoopLogger, nil, nil, nil, nil, nil, nil, false, kdb).(*service)
+
+	oldestMask := events.LocalIndexUpdated
+	newerMask := events.RemoteIndexUpdated
+	svc.eventSubs[oldestMask] = oldestSub
+	svc.eventSubs[newerMask] = newerSub
+	svc.eventSubsAccessTime[oldestMask] = time.Unix(1, 0)
+	svc.eventSubsAccessTime[newerMask] = time.Unix(2, 0)
+
+	svc.eventSubsMut.Lock()
+	svc.evictOldestEventSubLocked()
+	svc.eventSubsMut.Unlock()
+
+	if _, ok := svc.eventSubs[oldestMask]; ok {
+		t.Fatal("oldest subscription was not evicted")
+	}
+	if _, ok := svc.eventSubs[newerMask]; !ok {
+		t.Fatal("newer subscription should remain cached")
+	}
+	if oldestSub.UnsubscribeCallCount() != 1 {
+		t.Fatalf("expected evicted subscription to be unsubscribed once, got %d", oldestSub.UnsubscribeCallCount())
+	}
+	if newerSub.UnsubscribeCallCount() != 0 {
+		t.Fatalf("expected newer subscription to stay subscribed, got %d unsubscribes", newerSub.UnsubscribeCallCount())
+	}
+	if defSub.UnsubscribeCallCount() != 0 || diskSub.UnsubscribeCallCount() != 0 {
+		t.Fatal("default subscriptions must never be unsubscribed during eviction")
+	}
+}
+
+type testEventLogger struct {
+	subs map[events.EventType]*testEventSubscription
+	mut  sync.Mutex
+}
+
+func newTestEventLogger() *testEventLogger {
+	return &testEventLogger{
+		subs: make(map[events.EventType]*testEventSubscription),
+	}
+}
+
+func (*testEventLogger) Serve(context.Context) error { return nil }
+
+func (*testEventLogger) String() string { return "testEventLogger" }
+
+func (*testEventLogger) Log(events.EventType, interface{}) {}
+
+func (l *testEventLogger) Subscribe(mask events.EventType) events.Subscription {
+	l.mut.Lock()
+	defer l.mut.Unlock()
+
+	sub := &testEventSubscription{
+		mask:   mask,
+		events: make(chan events.Event),
+		closed: make(chan struct{}),
+	}
+	l.subs[mask] = sub
+	return sub
+}
+
+func (l *testEventLogger) subscription(mask events.EventType) *testEventSubscription {
+	l.mut.Lock()
+	defer l.mut.Unlock()
+	return l.subs[mask]
+}
+
+type testEventSubscription struct {
+	mask             events.EventType
+	events           chan events.Event
+	closed           chan struct{}
+	mut              sync.Mutex
+	unsubscribeCount int
+}
+
+func (s *testEventSubscription) C() <-chan events.Event {
+	return s.events
+}
+
+func (s *testEventSubscription) Poll(time.Duration) (events.Event, error) {
+	ev, ok := <-s.events
+	if !ok {
+		return events.Event{}, events.ErrClosed
+	}
+	return ev, nil
+}
+
+func (s *testEventSubscription) Mask() events.EventType {
+	return s.mask
+}
+
+func (s *testEventSubscription) Unsubscribe() {
+	s.mut.Lock()
+	defer s.mut.Unlock()
+	if s.unsubscribeCount > 0 {
+		return
+	}
+	s.unsubscribeCount++
+	close(s.events)
+	close(s.closed)
+}
+
+func (s *testEventSubscription) UnsubscribeCount() int {
+	s.mut.Lock()
+	defer s.mut.Unlock()
+	return s.unsubscribeCount
+}
+
+func eventMaskForTest(i int) events.EventType {
+	return events.EventType(1) << (i + 32)
+}
+
+func newTestServiceWithEventLogger(t *testing.T, logger events.Logger) *service {
+	t.Helper()
+
+	cfg := newMockedConfig()
+	defSub := new(eventmocks.BufferedSubscription)
+	diskSub := new(eventmocks.BufferedSubscription)
+	mdb, err := sqlite.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		mdb.Close()
+	})
+	kdb := db.NewMiscDB(mdb)
+	return New(protocol.LocalDeviceID, cfg, "", "syncthing", nil, defSub, diskSub, logger, nil, nil, nil, nil, nil, nil, false, kdb).(*service)
+}
+
+func TestGetEventSubEvictsAtLimit(t *testing.T) {
+	t.Parallel()
+
+	logger := newTestEventLogger()
+	svc := newTestServiceWithEventLogger(t, logger)
+
+	var oldestMask events.EventType
+	for i := 0; i < config.DefaultMaxEventSubs-2; i++ {
+		mask := eventMaskForTest(i)
+		if i == 0 {
+			oldestMask = mask
+		}
+		svc.getEventSub(mask)
+	}
+
+	if got := len(svc.eventSubs); got != config.DefaultMaxEventSubs {
+		t.Fatalf("expected cache to be full at %d entries, got %d", config.DefaultMaxEventSubs, got)
+	}
+
+	newMask := eventMaskForTest(config.DefaultMaxEventSubs - 2)
+	svc.getEventSub(newMask)
+
+	if got := len(svc.eventSubs); got != config.DefaultMaxEventSubs {
+		t.Fatalf("expected cache size to stay capped at %d, got %d", config.DefaultMaxEventSubs, got)
+	}
+	if _, ok := svc.eventSubs[oldestMask]; ok {
+		t.Fatal("expected oldest dynamic subscription to be evicted")
+	}
+	if _, ok := svc.eventSubs[newMask]; !ok {
+		t.Fatal("expected new subscription to be cached")
+	}
+
+	oldestSub := logger.subscription(oldestMask)
+	if oldestSub == nil {
+		t.Fatal("missing test subscription for oldest mask")
+	}
+	if oldestSub.UnsubscribeCount() != 1 {
+		t.Fatalf("expected oldest subscription to be unsubscribed once, got %d", oldestSub.UnsubscribeCount())
+	}
+	select {
+	case <-oldestSub.closed:
+	default:
+		t.Fatal("expected evicted subscription channel to be closed")
+	}
+}
+
+func TestGetEventSubRefreshesRecency(t *testing.T) {
+	t.Parallel()
+
+	logger := newTestEventLogger()
+	svc := newTestServiceWithEventLogger(t, logger)
+
+	oldMask := eventMaskForTest(0)
+	refreshedMask := eventMaskForTest(1)
+	svc.getEventSub(oldMask)
+	svc.getEventSub(refreshedMask)
+
+	for i := 2; i < config.DefaultMaxEventSubs-2; i++ {
+		svc.getEventSub(eventMaskForTest(i))
+	}
+
+	// Touch the older mask again so it becomes most recently used.
+	svc.getEventSub(oldMask)
+
+	newMask := eventMaskForTest(config.DefaultMaxEventSubs - 2)
+	svc.getEventSub(newMask)
+
+	if _, ok := svc.eventSubs[oldMask]; !ok {
+		t.Fatal("expected refreshed subscription to remain cached")
+	}
+	if _, ok := svc.eventSubs[refreshedMask]; ok {
+		t.Fatal("expected least recently used subscription to be evicted")
+	}
+
+	refreshedSub := logger.subscription(refreshedMask)
+	if refreshedSub == nil {
+		t.Fatal("missing test subscription for refreshed mask")
+	}
+	if refreshedSub.UnsubscribeCount() != 1 {
+		t.Fatalf("expected evicted least recently used subscription to be unsubscribed once, got %d", refreshedSub.UnsubscribeCount())
+	}
+	oldSub := logger.subscription(oldMask)
+	if oldSub == nil {
+		t.Fatal("missing test subscription for old mask")
+	}
+	if oldSub.UnsubscribeCount() != 0 {
+		t.Fatalf("expected refreshed subscription to stay active, got %d unsubscribes", oldSub.UnsubscribeCount())
 	}
 }
 

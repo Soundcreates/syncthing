@@ -78,6 +78,7 @@ type service struct {
 	statics              *staticsServer
 	model                model.Model
 	eventSubs            map[events.EventType]events.BufferedSubscription
+	eventSubsAccessTime  map[events.EventType]time.Time // tracks last access for LRU eviction
 	eventSubsMut         sync.Mutex
 	evLogger             events.Logger
 	discoverer           discover.Manager
@@ -108,6 +109,7 @@ type Service interface {
 }
 
 func New(id protocol.DeviceID, cfg config.Wrapper, assetDir, tlsDefaultCommonName string, m model.Model, defaultSub, diskSub events.BufferedSubscription, evLogger events.Logger, discoverer discover.Manager, connectionsService connections.Service, urService *ur.Service, fss model.FolderSummaryService, errors, systemLog slogutil.Recorder, noUpgrade bool, miscDB *db.Typed) Service {
+	now := time.Now()
 	return &service{
 		id:      id,
 		cfg:     cfg,
@@ -116,6 +118,10 @@ func New(id protocol.DeviceID, cfg config.Wrapper, assetDir, tlsDefaultCommonNam
 		eventSubs: map[events.EventType]events.BufferedSubscription{
 			DefaultEventMask: defaultSub,
 			DiskEventMask:    diskSub,
+		},
+		eventSubsAccessTime: map[events.EventType]time.Time{
+			DefaultEventMask: now,
+			DiskEventMask:    now,
 		},
 		evLogger:             evLogger,
 		discoverer:           discoverer,
@@ -1389,15 +1395,52 @@ func (*service) getEventMask(evs string) events.EventType {
 
 func (s *service) getEventSub(mask events.EventType) events.BufferedSubscription {
 	s.eventSubsMut.Lock()
+	defer s.eventSubsMut.Unlock()
+
+	// Update or fetch subscription
 	bufsub, ok := s.eventSubs[mask]
 	if !ok {
+		// If we've hit the cache limit, evict the least recently used subscription
+		if len(s.eventSubs) >= s.cfg.Options().MaxEventSubs() {
+			s.evictOldestEventSubLocked()
+		}
+
 		evsub := s.evLogger.Subscribe(mask)
 		bufsub = events.NewBufferedSubscription(evsub, EventSubBufferSize)
 		s.eventSubs[mask] = bufsub
 	}
-	s.eventSubsMut.Unlock()
+
+	// Update access time
+	s.eventSubsAccessTime[mask] = time.Now()
 
 	return bufsub
+}
+
+// evictOldestEventSubLocked removes the least recently used subscription.
+// Must be called with eventSubsMut locked.
+func (s *service) evictOldestEventSubLocked() {
+	var oldestSub events.BufferedSubscription
+	var oldestMask events.EventType
+	var oldestTime time.Time
+
+	// Find the least recently used (earliest access time)
+	for mask, sub := range s.eventSubs {
+		if mask == DefaultEventMask || mask == DiskEventMask {
+			continue
+		}
+		accessTime := s.eventSubsAccessTime[mask]
+		if oldestTime.IsZero() || accessTime.Before(oldestTime) {
+			oldestSub = sub
+			oldestMask = mask
+			oldestTime = accessTime
+		}
+	}
+
+	if oldestSub != nil {
+		delete(s.eventSubs, oldestMask)
+		delete(s.eventSubsAccessTime, oldestMask)
+		oldestSub.Unsubscribe()
+	}
 }
 
 func (s *service) getSystemUpgrade(w http.ResponseWriter, _ *http.Request) {
